@@ -101,11 +101,12 @@ const MODELS: ModelOption[] = [
   },
 ];
 
-export function PromptInput() {
+export function BatchPromptInput() {
   const [prompt, setPrompt] = useState("");
   const [selectedModel, setSelectedModel] = useState(MODELS[0].value);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [batchCount, setBatchCount] = useState("1");
 
   const selectedModelData = MODELS.find((m) => m.value === selectedModel) || MODELS[0];
 
@@ -116,7 +117,8 @@ export function PromptInput() {
     }
 
     setIsLoading(true);
-    let taskId: number | undefined;
+    const count = parseInt(batchCount);
+    const taskIds: number[] = [];
 
     try {
       const configSetting = await db.settings.where({ key: "config" }).first();
@@ -129,41 +131,36 @@ export function PromptInput() {
       }
 
       const currentModelInfo = MODELS.find((m) => m.value === selectedModel);
-      
-      // Create pending task
-      taskId = await db.tasks.add({
-        prompt,
-        model: selectedModel,
-        type: currentModelInfo?.type || "image",
-        status: "pending",
-        createdAt: new Date(),
-      });
 
-      // OpenAI format streaming request
-      // Append /v1/chat/completions if not already present
-      const endpoint = apiUrl.endsWith("/v1/chat/completions")
-        ? apiUrl
-        : `${apiUrl.replace(/\/+$/, "")}/v1/chat/completions`;
+      // Create pending tasks
+      for (let i = 0; i < count; i++) {
+        const id = await db.tasks.add({
+          prompt,
+          model: selectedModel,
+          type: currentModelInfo?.type || "image",
+          status: "pending",
+          createdAt: new Date(),
+        });
+        taskIds.push(id as number);
+      }
 
-      const response = await fetch(endpoint, {
+      const response = await fetch("/api/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: selectedModel,
-          messages: [{ role: "user", content: prompt }],
-          stream: true,
+          config: { apiUrl, apiKey },
+          globalModel: selectedModel,
+          tasks: taskIds.map(() => ({ prompt, model: selectedModel })),
         }),
       });
 
-      if (!response.ok) throw new Error("API request failed");
+      if (!response.ok) throw new Error("BFF request failed");
       if (!response.body) throw new Error("No response body");
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let accumulatedContent = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -177,8 +174,22 @@ export function PromptInput() {
           if (line.startsWith("data: ")) {
             try {
               const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta?.content) {
-                accumulatedContent += data.choices[0].delta.content;
+              const { taskId: taskIndex, status, result, error } = data;
+              
+              const actualTaskId = taskIds[taskIndex];
+              if (actualTaskId) {
+                if (status === 'success') {
+                    await db.tasks.update(actualTaskId, {
+                        status: "success",
+                        result: result,
+                    });
+                } else if (status === 'failed') {
+                    await db.tasks.update(actualTaskId, {
+                        status: "failed",
+                        result: error,
+                    });
+                }
+                // We could also handle 'processing' status to show partial updates if DB supports it
               }
             } catch (e) {
               console.error("Error parsing stream chunk", e);
@@ -187,28 +198,14 @@ export function PromptInput() {
         }
       }
 
-      // Extract URL from the accumulated content (assuming the model returns the URL in the content)
-      // This logic might need adjustment based on the actual API response format for images/videos
-      // If the API returns a markdown image link or raw URL, we try to extract it.
-      const urlMatch = accumulatedContent.match(/https?:\/\/[^\s)]+/);
-      const generatedUrl = urlMatch ? urlMatch[0] : accumulatedContent;
-
-      // Update task status to success
-      if (taskId) {
-        await db.tasks.update(taskId, {
-          status: "success",
-          result: generatedUrl,
-        });
-      }
-
-      toast.success("生成成功！");
+      toast.success("任务提交成功！");
       setPrompt("");
     } catch (error) {
       console.error("Generation failed:", error);
       toast.error("生成失败，请检查配置或网络");
-      // Update task status to failed
-      if (taskId) {
-        await db.tasks.update(taskId, {
+      // Update all tasks to failed if the batch request itself fails
+      for (const id of taskIds) {
+        await db.tasks.update(id, {
           status: "failed",
           result: error instanceof Error ? error.message : "Unknown error",
         });
@@ -352,7 +349,17 @@ export function PromptInput() {
               <SelectItem value="1:1">1:1</SelectItem>
             </SelectContent>
           </Select>
-          
+          <Select value={batchCount} onValueChange={setBatchCount}>
+            <SelectTrigger className="w-[100px] border-0 bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground dark:bg-white/5 dark:hover:bg-white/10 transition-colors focus:ring-0 focus:ring-offset-0">
+              <SelectValue placeholder="数量" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">生成1条</SelectItem>
+              <SelectItem value="2">生成2条</SelectItem>
+              <SelectItem value="4">生成4条</SelectItem>
+              <SelectItem value="5">生成5条</SelectItem>
+            </SelectContent>
+          </Select>
           <Button variant="ghost" size="icon" className="bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground dark:bg-white/5 dark:hover:bg-white/10 transition-colors">
             <Wand2 className="h-4 w-4" />
           </Button>

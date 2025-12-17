@@ -1,14 +1,18 @@
 "use client";
 
+import { useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { db } from "@/lib/db";
-import { Loader2, AlertCircle, FileVideo, ImageIcon, Clock, Download } from "lucide-react";
+import { Loader2, AlertCircle, FileVideo, ImageIcon, Clock, Download, CheckCircle2, Film } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogTrigger } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
 export function TaskHistory() {
+  const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([]);
+  const [isStitching, setIsStitching] = useState(false);
+
   const tasks = useLiveQuery(() =>
     db.tasks.orderBy("createdAt").reverse().limit(50).toArray()
   );
@@ -34,19 +38,127 @@ export function TaskHistory() {
     }
   };
 
+  const toggleSelection = (id: number) => {
+    setSelectedTaskIds(prev =>
+      prev.includes(id) ? prev.filter(taskId => taskId !== id) : [...prev, id]
+    );
+  };
+
+  const handleStitch = async () => {
+    if (selectedTaskIds.length < 2) {
+        toast.error("请至少选择两个视频进行拼接");
+        return;
+    }
+
+    setIsStitching(true);
+    try {
+        const configSetting = await db.settings.where({ key: "config" }).first();
+        const apiUrl = configSetting?.value?.apiUrl;
+        const apiKey = configSetting?.value?.apiKey;
+
+        if (!apiUrl || !apiKey) {
+            toast.error("请先配置 API 地址和密钥");
+            return;
+        }
+
+        const selectedTasks = tasks?.filter(t => t.id && selectedTaskIds.includes(t.id));
+        const videoUrls = selectedTasks?.map(t => t.result).filter(Boolean) as string[];
+
+        if (videoUrls.length < 2) {
+             toast.error("选中的任务中包含无效的视频链接");
+             return;
+        }
+
+        const response = await fetch("/api/stitch", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                config: { apiUrl, apiKey },
+                videoUrls,
+            }),
+        });
+        
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            toast.success("拼接请求已发送");
+            // Assuming the stitch API returns a result immediately or we handle it somehow.
+            // If it returns a new video URL directly:
+            if (data.result) {
+                 await db.tasks.add({
+                    prompt: `Stitch of ${selectedTaskIds.length} videos`,
+                    model: "stitch-v1",
+                    type: "video",
+                    status: "success",
+                    result: data.result,
+                    createdAt: new Date(),
+                 });
+            }
+            setSelectedTaskIds([]);
+        } else {
+            throw new Error(data.error || "Stitch failed");
+        }
+
+    } catch (error) {
+        console.error("Stitch failed:", error);
+        toast.error("拼接失败");
+    } finally {
+        setIsStitching(false);
+    }
+  };
+
+
   if (!tasks?.length) return null;
 
   return (
     <div className="w-full max-w-[1400px]">
-      <div className="mb-6 flex items-center gap-2 px-2">
-        <Clock className="h-5 w-5 text-gray-400" />
-        <h2 className="text-lg font-semibold text-gray-700">生成历史</h2>
+      <div className="mb-6 flex items-center justify-between px-2">
+        <div className="flex items-center gap-2">
+            <Clock className="h-5 w-5 text-gray-400" />
+            <h2 className="text-lg font-semibold text-gray-700">生成历史</h2>
+        </div>
+        {selectedTaskIds.length > 0 && (
+             <div className="flex items-center gap-4">
+                 <span className="text-sm text-gray-500">已选择 {selectedTaskIds.length} 项</span>
+                 <Button
+                    size="sm"
+                    onClick={handleStitch}
+                    disabled={isStitching || selectedTaskIds.length < 2}
+                    className="gap-2 bg-blue-600 hover:bg-blue-700 text-white"
+                 >
+                    {isStitching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Film className="h-4 w-4" />}
+                    拼接/Remix
+                 </Button>
+                 <Button variant="ghost" size="sm" onClick={() => setSelectedTaskIds([])}>取消</Button>
+             </div>
+        )}
       </div>
       <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5">
         {tasks.map((task) => (
-          <div key={task.id} className="group relative flex flex-col overflow-hidden rounded-3xl bg-card border border-border shadow-sm transition-all hover:-translate-y-1 hover:shadow-xl dark:shadow-none dark:hover:border-primary/50 dark:hover:bg-card/80">
+          <div
+            key={task.id}
+            className={cn(
+                "group relative flex flex-col overflow-hidden rounded-3xl bg-card border shadow-sm transition-all hover:-translate-y-1 hover:shadow-xl dark:shadow-none dark:hover:bg-card/80",
+                selectedTaskIds.includes(task.id!)
+                    ? "border-blue-500 ring-2 ring-blue-500/20"
+                    : "border-border hover:border-primary/50"
+            )}
+            onClick={() => task.id && toggleSelection(task.id)}
+          >
              {/* Header: Result Preview (Top) */}
              <div className="relative aspect-[4/3] w-full overflow-hidden bg-muted">
+               <div className="absolute right-3 top-10 z-10 opacity-0 transition-opacity group-hover:opacity-100">
+                    <div className={cn(
+                        "h-6 w-6 rounded-full border-2 flex items-center justify-center",
+                        selectedTaskIds.includes(task.id!)
+                            ? "bg-blue-500 border-blue-500"
+                            : "bg-black/30 border-white"
+                    )}>
+                        {selectedTaskIds.includes(task.id!) && <CheckCircle2 className="h-4 w-4 text-white" />}
+                    </div>
+               </div>
                {task.status === 'pending' && (
                  <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-muted-foreground">
                    <Loader2 className="h-8 w-8 animate-spin" />
@@ -64,7 +176,7 @@ export function TaskHistory() {
                {task.status === 'success' && task.result && (
                  <Dialog>
                    <DialogTrigger asChild>
-                     <div className="group/image relative h-full w-full cursor-pointer">
+                     <div className="group/image relative h-full w-full cursor-pointer" onClick={(e) => e.stopPropagation()}>
                        {task.type === 'video' ? (
                          <video
                            src={task.result}
