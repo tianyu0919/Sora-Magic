@@ -21,7 +21,10 @@ export async function POST(req: Request) {
     const { config, globalModel, tasks } = (await req.json()) as RequestBody;
     const { apiUrl, apiKey } = config;
 
+    console.log(`[Batch Generate] Received request with ${tasks.length} tasks. Global Model: ${globalModel}`);
+
     if (!apiUrl || !apiKey) {
+      console.error('[Batch Generate] Missing configuration');
       return NextResponse.json({ error: 'Missing configuration' }, { status: 400 });
     }
 
@@ -29,25 +32,35 @@ export async function POST(req: Request) {
       ? apiUrl
       : `${apiUrl.replace(/\/+$/, '')}/v1/chat/completions`;
 
+    console.log(`[Batch Generate] Upstream Endpoint: ${endpoint}`);
+
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
 
-        for (let i = 0; i < tasks.length; i++) {
-          const task = tasks[i];
+        const processTask = async (task: Task, index: number) => {
           const currentModel = task.model || globalModel;
+          console.log(`[Task ${index}] Starting. Model: ${currentModel}, Prompt: ${task.prompt.substring(0, 50)}...`);
 
           try {
             // Notify start of task
             controller.enqueue(
               encoder.encode(
                 `data: ${JSON.stringify({
-                  taskId: i,
+                  taskId: index,
                   status: 'pending',
                   message: 'Starting generation...',
                 })}\n\n`
               )
             );
+
+            const requestBody = {
+              model: currentModel,
+              messages: [{ role: 'user', content: task.prompt }],
+              stream: true,
+            };
+            
+            console.log(`[Task ${index}] Sending request to upstream...`);
 
             const response = await fetch(endpoint, {
               method: 'POST',
@@ -55,12 +68,10 @@ export async function POST(req: Request) {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${apiKey}`,
               },
-              body: JSON.stringify({
-                model: currentModel,
-                messages: [{ role: 'user', content: task.prompt }],
-                stream: true,
-              }),
+              body: JSON.stringify(requestBody),
             });
+
+            console.log(`[Task ${index}] Upstream response status: ${response.status}`);
 
             if (!response.ok) {
               throw new Error(`Upstream API error: ${response.statusText}`);
@@ -73,6 +84,7 @@ export async function POST(req: Request) {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let accumulatedContent = '';
+            let chunkCount = 0;
 
             while (true) {
               const { done, value } = await reader.read();
@@ -89,11 +101,18 @@ export async function POST(req: Request) {
                     const content = data.choices?.[0]?.delta?.content || '';
                     if (content) {
                       accumulatedContent += content;
+                      chunkCount++;
+                      
+                      // Log first chunk to verify data flow
+                      if (chunkCount === 1) {
+                         console.log(`[Task ${index}] Received first content chunk: ${content.substring(0, 20)}...`);
+                      }
+
                       // Stream partial content update
                       controller.enqueue(
                         encoder.encode(
                           `data: ${JSON.stringify({
-                            taskId: i,
+                            taskId: index,
                             status: 'processing',
                             content: content,
                           })}\n\n`
@@ -101,40 +120,66 @@ export async function POST(req: Request) {
                       );
                     }
                   } catch (e) {
-                    console.error('Error parsing chunk:', e);
+                    console.error(`[Task ${index}] Error parsing chunk:`, e);
                   }
                 }
               }
             }
 
-            // Task completed, try to extract URL if possible, otherwise send full content
-            // Assuming the content itself is the result or contains the URL
-            const urlMatch = accumulatedContent.match(/https?:\/\/[^\s)]+/);
-            const resultUrl = urlMatch ? urlMatch[0] : accumulatedContent;
+            console.log(`[Task ${index}] Stream finished. Total accumulated content length: ${accumulatedContent.length}`);
 
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({
-                  taskId: i,
-                  status: 'success',
-                  result: resultUrl,
-                })}\n\n`
-              )
-            );
+            // Task completed, try to extract URL if possible, otherwise send full content
+            const urlMatch = accumulatedContent.match(/https?:\/\/[^\s)]+/);
+            let resultUrl = urlMatch ? urlMatch[0] : accumulatedContent;
+
+            // Remove surrounding quotes if present
+            resultUrl = resultUrl.replace(/^['"]|['"]$/g, '');
+
+            console.log(`[Task ${index}] Final Result URL/Content: ${resultUrl}...`);
+
+            // Check for error messages in the content
+            const errorKeywords = ["生成失败", "violate", "error", "failed", "rejected"];
+            const isError = errorKeywords.some(keyword => resultUrl.toLowerCase().includes(keyword.toLowerCase()));
+
+            if (isError) {
+                console.warn(`[Task ${index}] Detected error in content, marking as failed.`);
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      taskId: index,
+                      status: 'failed',
+                      error: resultUrl, // Send the content as the error message
+                    })}\n\n`
+                  )
+                );
+            } else {
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      taskId: index,
+                      status: 'success',
+                      result: resultUrl,
+                    })}\n\n`
+                  )
+                );
+            }
 
           } catch (error) {
-            console.error(`Task ${i} failed:`, error);
+            console.error(`[Task ${index}] Failed:`, error);
             controller.enqueue(
               encoder.encode(
                 `data: ${JSON.stringify({
-                  taskId: i,
+                  taskId: index,
                   status: 'failed',
                   error: error instanceof Error ? error.message : 'Unknown error',
                 })}\n\n`
               )
             );
           }
-        }
+        };
+
+        // Execute all tasks concurrently
+        await Promise.all(tasks.map((task, index) => processTask(task, index)));
         
         // End of all tasks
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));

@@ -3,8 +3,19 @@
 import { useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { db } from "@/lib/db";
-import { Loader2, AlertCircle, FileVideo, ImageIcon, Clock, Download, CheckCircle2, Film } from "lucide-react";
+import { Loader2, AlertCircle, FileVideo, ImageIcon, Clock, Download, CheckCircle2, Film, Trash2 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogTrigger } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -12,6 +23,7 @@ import { toast } from "sonner";
 export function TaskHistory() {
   const [selectedTaskIds, setSelectedTaskIds] = useState<number[]>([]);
   const [isStitching, setIsStitching] = useState(false);
+  const [isClearDialogOpen, setIsClearDialogOpen] = useState(false);
 
   const tasks = useLiveQuery(() =>
     db.tasks.orderBy("createdAt").reverse().limit(50).toArray()
@@ -50,6 +62,14 @@ export function TaskHistory() {
         return;
     }
 
+    const selectedTasks = tasks?.filter(t => t.id && selectedTaskIds.includes(t.id));
+    const hasNonVideo = selectedTasks?.some(t => t.type !== 'video');
+
+    if (hasNonVideo) {
+        toast.error("拼接功能仅支持视频任务，请取消选择图片任务");
+        return;
+    }
+
     setIsStitching(true);
     try {
         const configSetting = await db.settings.where({ key: "config" }).first();
@@ -61,7 +81,6 @@ export function TaskHistory() {
             return;
         }
 
-        const selectedTasks = tasks?.filter(t => t.id && selectedTaskIds.includes(t.id));
         const videoUrls = selectedTasks?.map(t => t.result).filter(Boolean) as string[];
 
         if (videoUrls.length < 2) {
@@ -109,6 +128,32 @@ export function TaskHistory() {
     }
   };
 
+  const handleDelete = async (id: number) => {
+    try {
+      await db.tasks.delete(id);
+      toast.success("任务已删除");
+      // If the deleted task was selected, remove it from selection
+      if (selectedTaskIds.includes(id)) {
+        setSelectedTaskIds(prev => prev.filter(taskId => taskId !== id));
+      }
+    } catch (error) {
+      console.error("Failed to delete task:", error);
+      toast.error("删除失败");
+    }
+  };
+
+  const handleClearAll = async () => {
+    try {
+      await db.tasks.clear();
+      toast.success("历史记录已清空");
+      setSelectedTaskIds([]);
+      setIsClearDialogOpen(false);
+    } catch (error) {
+      console.error("Failed to clear history:", error);
+      toast.error("清空失败");
+    }
+  };
+
 
   if (!tasks?.length) return null;
 
@@ -118,6 +163,32 @@ export function TaskHistory() {
         <div className="flex items-center gap-2">
             <Clock className="h-5 w-5 text-gray-400" />
             <h2 className="text-lg font-semibold text-gray-700">生成历史</h2>
+            <AlertDialog open={isClearDialogOpen} onOpenChange={setIsClearDialogOpen}>
+              <AlertDialogTrigger asChild>
+                <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2 text-muted-foreground hover:text-destructive"
+                    title="清空历史"
+                >
+                    <Trash2 className="h-4 w-4" />
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>确定要清空所有历史记录吗？</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    此操作将永久删除所有生成的图片和视频记录，且无法恢复。
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>取消</AlertDialogCancel>
+                  <AlertDialogAction onClick={handleClearAll} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+                    确认清空
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
         </div>
         {selectedTaskIds.length > 0 && (
              <div className="flex items-center gap-4">
@@ -246,6 +317,17 @@ export function TaskHistory() {
                     {task.type === 'video' ? <FileVideo className="h-3 w-3" /> : <ImageIcon className="h-3 w-3" />}
                     {task.type === 'video' ? 'VIDEO' : 'IMAGE'}
                  </div>
+                 <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 rounded-full bg-black/20 text-white hover:bg-red-500 hover:text-white backdrop-blur-md"
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        if (task.id) handleDelete(task.id);
+                    }}
+                 >
+                    <Trash2 className="h-3 w-3" />
+                 </Button>
                </div>
              </div>
              
